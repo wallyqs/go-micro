@@ -29,6 +29,9 @@ type httpTransport struct {
 }
 
 type httpTransportClient struct {
+	client *http.Client
+	secure bool
+
 	ht       *httpTransport
 	addr     string
 	conn     net.Conn
@@ -36,9 +39,13 @@ type httpTransportClient struct {
 	once     sync.Once
 
 	sync.Mutex
-	r    chan *http.Request
-	bl   []*http.Request
+	req chan *http.Request
+	rsp chan *http.Response
+	// backlog of requests
+	bl []*http.Request
+	// buffered http conn
 	buff *bufio.Reader
+	body *buffer
 
 	// local/remote ip
 	local  string
@@ -78,18 +85,36 @@ func (h *httpTransportClient) Remote() string {
 }
 
 func (h *httpTransportClient) Send(m *Message) error {
+	h.Lock()
+	defer h.Unlock()
+
+	// buffer closed
+	if h.buff == nil {
+		return io.EOF
+	}
+
+	// got a request & it's http/2.0
+	// it means we also got a response
+	if h.body != nil {
+		// attempt to send data directly to the connection
+		_, err := h.body.Write(m.Body)
+		return err
+	}
+
+	// create a new request
 	header := make(http.Header)
 
 	for k, v := range m.Header {
 		header.Set(k, v)
 	}
 
-	reqB := bytes.NewBuffer(m.Body)
-	defer reqB.Reset()
-	buf := &buffer{
-		reqB,
-	}
+	// create a new request body
+	rbuf := bytes.NewBuffer(m.Body)
 
+	// create body
+	body := &buffer{rbuf}
+
+	// create a new request
 	req := &http.Request{
 		Method: "POST",
 		URL: &url.URL{
@@ -97,80 +122,197 @@ func (h *httpTransportClient) Send(m *Message) error {
 			Host:   h.addr,
 		},
 		Header:        header,
-		Body:          buf,
-		ContentLength: int64(reqB.Len()),
+		Body:          body,
+		ContentLength: int64(rbuf.Len()),
 		Host:          h.addr,
 	}
 
-	h.Lock()
-	h.bl = append(h.bl, req)
+	// set https
+	if h.secure {
+		req.URL.Scheme = "https"
+	}
+
+	// pop the first request from the stack
+	// put that in the request channel
+	// trim the stack by 1
+	var r *http.Request
+
+	// attempt to get request
 	select {
-	case h.r <- h.bl[0]:
+	case re, ok := <-h.req:
+		if !ok {
+			return io.EOF
+		}
+		r = re
+	default:
+		// no req
+	}
+
+	// append request to the backlog
+	h.bl = append(h.bl, req)
+
+	// save request
+	select {
+	case h.req <- h.bl[0]:
 		h.bl = h.bl[1:]
 	default:
-	}
-	h.Unlock()
-
-	// set timeout if its greater than 0
-	if h.ht.opts.Timeout > time.Duration(0) {
-		h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
+		// no op if we block
 	}
 
-	return req.Write(h.conn)
+	// not the first request and its http/1.1
+	if r != nil && r.ProtoMajor == 1 {
+		defer rbuf.Reset()
+
+		// set timeout if its greater than 0
+		if h.ht.opts.Timeout > time.Duration(0) {
+			h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
+		}
+
+		// write the request
+		return req.Write(h.conn)
+	}
+
+	// its a brand new request!
+
+	// make the actual request
+	rsp, err := h.client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	// if http2 response then save body
+	if rsp.ProtoMajor == 2 {
+		h.body = body
+	} else {
+		rbuf.Reset()
+	}
+
+	// save the response
+	req.Proto = rsp.Proto
+	req.ProtoMajor = rsp.ProtoMajor
+	req.ProtoMinor = rsp.ProtoMinor
+	h.rsp <- rsp
+
+	return nil
 }
 
 func (h *httpTransportClient) Recv(m *Message) error {
+	// no message return error
 	if m == nil {
 		return errors.New("message passed in is nil")
 	}
 
-	var r *http.Request
-	if !h.dialOpts.Stream {
-		rc, ok := <-h.r
-		if !ok {
-			return io.EOF
-		}
-		r = rc
-	}
-
+	// now lock and work
 	h.Lock()
 	defer h.Unlock()
+
+	// get the response or block until available
+	rsp, ok := <-h.rsp
+	if !ok {
+		return io.EOF
+	}
+
+	// no buffer means client is closed
 	if h.buff == nil {
 		return io.EOF
 	}
 
-	// set timeout if its greater than 0
-	if h.ht.opts.Timeout > time.Duration(0) {
-		h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
-	}
-
-	rsp, err := http.ReadResponse(h.buff, r)
-	if err != nil {
-		return err
-	}
-	defer rsp.Body.Close()
-
-	b, err := ioutil.ReadAll(rsp.Body)
-	if err != nil {
-		return err
-	}
-
-	if rsp.StatusCode != 200 {
-		return errors.New(rsp.Status + ": " + string(b))
-	}
-
-	m.Body = b
-
+	// set message header if not exist
 	if m.Header == nil {
 		m.Header = make(map[string]string)
 	}
 
+	// we got a http/1.1
+	if rsp.ProtoMajor == 1 {
+		// if we've read it before it will be nil
+		// so get a new request and read a new response
+		if rsp.Body == nil {
+			// get the latest request
+			r, ok := <-h.req
+			if !ok {
+				return io.EOF
+			}
+
+			// set timeout if its greater than 0
+			if h.ht.opts.Timeout > time.Duration(0) {
+				h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
+			}
+
+			// read the response
+			nrsp, err := http.ReadResponse(h.buff, r)
+			if err != nil {
+				return err
+			}
+			defer nrsp.Body.Close()
+
+			// replace the response
+			rsp = nrsp
+		}
+
+		// read the body
+		b, err := ioutil.ReadAll(rsp.Body)
+		if err != nil {
+			return err
+		}
+
+		// only process a 200 response
+		if rsp.StatusCode != 200 {
+			return errors.New(rsp.Status + ": " + string(b))
+		}
+
+		// set response body to read
+		rsp.Body = nil
+
+		// set the body
+		m.Body = b
+
+		// set the headers
+		for k, v := range rsp.Header {
+			if len(v) > 0 {
+				m.Header[k] = v[0]
+			} else {
+				m.Header[k] = ""
+			}
+		}
+
+		// save the response for later
+		h.rsp <- rsp
+
+		return nil
+	}
+
+	// we got a http/2.0 response
+
+	// set max buffer size
+	buf := make([]byte, 4*1024)
+
+	// read the request body
+	n, err := rsp.Body.Read(buf)
+	// not an eof error
+	if err != nil {
+		return err
+	}
+
+	// check if we have data
+	if n > 0 {
+		m.Body = buf[:n]
+	}
+
+	// set headers
 	for k, v := range rsp.Header {
 		if len(v) > 0 {
 			m.Header[k] = v[0]
 		} else {
 			m.Header[k] = ""
 		}
+	}
+
+	// pop the response back
+	h.rsp <- rsp
+
+	// expect 200 response
+	if rsp.StatusCode != 200 {
+		return errors.New(rsp.Status + ": " + string(m.Body))
 	}
 
 	return nil
@@ -182,8 +324,11 @@ func (h *httpTransportClient) Close() error {
 		h.Lock()
 		h.buff.Reset(nil)
 		h.buff = nil
+		h.body = nil
+		// close while locked, meaning write while locked
+		close(h.req)
+		close(h.rsp)
 		h.Unlock()
-		close(h.r)
 	})
 	return err
 }
@@ -338,6 +483,14 @@ func (h *httpTransportSocket) error(m *Message) error {
 
 		return rsp.Write(h.conn)
 	}
+
+	// write standard error
+	for k, v := range m.Header {
+		h.w.Header().Set(k, v)
+	}
+	h.w.WriteHeader(500)
+	h.w.Write(m.Body)
+
 	return nil
 }
 
@@ -445,10 +598,13 @@ func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
 
 	var conn net.Conn
 	var err error
+	var secure bool
 
 	// TODO: support dial option here rather than using internal config
 	if h.opts.Secure || h.opts.TLSConfig != nil {
+		secure = true
 		config := h.opts.TLSConfig
+
 		if config == nil {
 			config = &tls.Config{
 				InsecureSkipVerify: true,
@@ -457,6 +613,7 @@ func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
 		conn, err = newConn(func(addr string) (net.Conn, error) {
 			return tls.DialWithDialer(&net.Dialer{Timeout: dopts.Timeout}, "tcp", addr, config)
 		})(addr)
+
 	} else {
 		conn, err = newConn(func(addr string) (net.Conn, error) {
 			return net.DialTimeout("tcp", addr, dopts.Timeout)
@@ -467,13 +624,29 @@ func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
 		return nil, err
 	}
 
+	// create a http client
+	client := &http.Client{
+		Timeout: h.opts.Timeout,
+		Transport: &http2.Transport{
+			// allow h2c if no certs
+			AllowHTTP: !secure,
+			// return the dialed conn
+			DialTLS: func(network, addr string, c *tls.Config) (net.Conn, error) {
+				return conn, nil
+			},
+		},
+	}
+
 	return &httpTransportClient{
+		client:   client,
+		secure:   secure,
 		ht:       h,
 		addr:     addr,
 		conn:     conn,
 		buff:     bufio.NewReader(conn),
 		dialOpts: dopts,
-		r:        make(chan *http.Request, 1),
+		req:      make(chan *http.Request, 1),
+		rsp:      make(chan *http.Response, 1),
 		local:    conn.LocalAddr().String(),
 		remote:   conn.RemoteAddr().String(),
 	}, nil
