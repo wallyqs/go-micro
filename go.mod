@@ -43,8 +43,8 @@ require (
 	github.com/micro/micro v1.3.0
 	github.com/micro/util v0.2.0
 	github.com/mitchellh/hashstructure v1.0.0
-	github.com/nats-io/nats-streaming-server v0.14.3 // indirect
-	github.com/nats-io/nats.go v1.7.2
+	github.com/nats-io/nats-streaming-server v0.15.0 // indirect
+	github.com/nats-io/nats.go v1.8.1
 	github.com/nlopes/slack v0.5.0
 	github.com/pborman/uuid v1.2.0
 	github.com/pkg/errors v0.8.1
